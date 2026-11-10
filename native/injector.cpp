@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <ctime>
@@ -16,6 +17,7 @@
 // shipped inside the module; root can read it
 static const char *kPayloadSrc = "/data/adb/modules/codm_overlay/assets/libcodm.so";
 static const char *kLog        = "/data/adb/codm/injector.log";
+static const char *kPidFile    = "/data/adb/codm/injector.pid";
 
 static void logline(const char *fmt, ...)
 {
@@ -37,16 +39,34 @@ static void logline(const char *fmt, ...)
     fclose(f);
 }
 
-static pid_t find_pid(const char *pkg)
+// A daemon that ptrace-attaches to a game is worth exactly as much on `ps` as
+// its name says. comm + argv[0] get rewritten; setsid drops the controlling tty.
+static void disguise(int argc, char **argv, const char *name)
+{
+    setsid();
+    prctl(PR_SET_NAME, name, 0UL, 0UL, 0UL);
+    if (argc > 0 && argv && argv[0]) {
+        size_t cap = strlen(argv[0]);
+        size_t n = strlen(name);
+        if (n > cap)
+            n = cap;
+        memset(argv[0], 0, cap);
+        memcpy(argv[0], name, n);
+    }
+}
+
+// CODM spawns helper processes (`pkg:push`, remote config, crash reporter).
+// The engine normally lives in the main process, but on some builds Unity ends
+// up in a child, so match the package and every `pkg:*` subprocess.
+static int find_pids(const char *pkg, pid_t *out, int max)
 {
     DIR *d = opendir("/proc");
     if (!d)
-        return -1;
-    pid_t found = -1;
+        return 0;
+    size_t plen = strlen(pkg);
+    int n = 0;
     dirent *de;
-    char want[256];
-    snprintf(want, sizeof(want), "%s", pkg);
-    while ((de = readdir(d))) {
+    while ((de = readdir(d)) && n < max) {
         char *end = nullptr;
         long pid = strtol(de->d_name, &end, 10);
         if (!end || *end || pid <= 0)
@@ -56,18 +76,16 @@ static pid_t find_pid(const char *pkg)
         int fd = open(path, O_RDONLY);
         if (fd < 0)
             continue;
-        ssize_t n = read(fd, cmd, sizeof(cmd) - 1);
+        ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
         close(fd);
-        if (n <= 0)
+        if (r <= 0)
             continue;
-        cmd[n] = 0;
-        if (strcmp(cmd, want) == 0) {
-            found = (pid_t)pid;
-            break;
-        }
+        cmd[r] = 0;
+        if (strncmp(cmd, pkg, plen) == 0 && (cmd[plen] == 0 || cmd[plen] == ':'))
+            out[n++] = (pid_t)pid;
     }
     closedir(d);
-    return found;
+    return n;
 }
 
 static bool injected_before(pid_t pid)
@@ -185,6 +203,17 @@ static bool stage_payload(pid_t pid, const char *pkg, char *out, size_t cap)
         return false;
     }
     chmod(out, 0644);
+
+    // the app uid cannot traverse /data/adb, so drop a copy of the cfg next to
+    // the payload; the payload reads code_cache/codm.cfg and the original both
+    char cfgdst[300];
+    snprintf(cfgdst, sizeof(cfgdst), "%s/codm.cfg", dir);
+    if (copy_file(CODM_CFG_PATH, cfgdst)) {
+        chown(cfgdst, uid, gid);
+        chmod(cfgdst, 0600);
+    } else {
+        logline("cfg mirror %s failed (payload keeps defaults)", CODM_CFG_PATH);
+    }
     return true;
 }
 
@@ -241,8 +270,41 @@ static bool inject(pid_t pid, const char *pkg)
 
 int main(int argc, char **argv)
 {
-    (void)argc;
     mkdir(CODM_STATE_DIR, 0755);
+
+    // single instance: codm.sh restarts us while the Magisk watchdog may also
+    // respawn. whoever gets the lock writes the pidfile; the loser exits before
+    // it can fight over a target.
+    int lockfd = open(CODM_STATE_DIR "/injector.lock", O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (lockfd >= 0) {
+        struct flock fl{};
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        if (fcntl(lockfd, F_SETLK, &fl) != 0)
+            return 0;
+    }
+
+    // written by the lock holder only, atomically, so status/stop always point
+    // at a live daemon even after the comm/argv disguise lands
+    {
+        char tmp[128];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", kPidFile);
+        FILE *pf = fopen(tmp, "w");
+        if (pf) {
+            fprintf(pf, "%d\n", (int)getpid());
+            fclose(pf);
+            rename(tmp, kPidFile);
+        }
+    }
+
+    // stealth knobs that belong to the root side: process identity + silence
+    CfgFile boot_cfg(CODM_CFG_PATH);
+    if (boot_cfg.geti("stealth.quiet", 0))
+        codm_set_quiet(true);
+    if (boot_cfg.geti("stealth.enable", 1) && boot_cfg.geti("stealth.hide_proc", 1)) {
+        std::string name = boot_cfg.gets("stealth.proc_name", "kworker/u16:2");
+        disguise(argc, argv, name.c_str());
+    }
 
     const char *only = nullptr;
     bool once = false;
@@ -266,36 +328,39 @@ int main(int argc, char **argv)
         for (const char *pkg : kTargets) {
             if (only && strcmp(only, pkg) != 0)
                 continue;
-            pid_t pid = find_pid(pkg);
-            if (pid <= 0)
-                continue;
-            if (injected_before(pid))
-                continue;
-
-            // the dynamic loader has to be up before we can hijack a call into it
-            if (wait_for_maps) {
-                char maps[64];
-                snprintf(maps, sizeof(maps), "/proc/%d/maps", pid);
-                FILE *f = fopen(maps, "r");
-                bool ready = false;
-                if (f) {
-                    char line[512];
-                    while (fgets(line, sizeof(line), f))
-                        if (strstr(line, "libdl.so") || strstr(line, "linker64")) {
-                            ready = true;
-                            break;
-                        }
-                    fclose(f);
-                }
-                if (!ready) {
-                    usleep(50 * 1000);
+            pid_t pids[8];
+            int np = find_pids(pkg, pids, 8);
+            for (int i = 0; i < np; i++) {
+                pid_t pid = pids[i];
+                if (injected_before(pid))
                     continue;
-                }
-            }
 
-            logline("target up: %s pid=%d", pkg, pid);
-            if (inject(pid, pkg) && once)
-                return 0;
+                // the dynamic loader has to be up before we can hijack a call into it.
+                // the payload now waits for libil2cpp indefinitely, so injecting
+                // early costs one sleeping thread and nothing else
+                if (wait_for_maps) {
+                    char maps[64];
+                    snprintf(maps, sizeof(maps), "/proc/%d/maps", pid);
+                    FILE *f = fopen(maps, "r");
+                    bool ready = false;
+                    if (f) {
+                        char line[512];
+                        while (fgets(line, sizeof(line), f))
+                            if (strstr(line, "libdl.so") || strstr(line, "linker64") ||
+                                strstr(line, "libil2cpp.so")) {
+                                ready = true;
+                                break;
+                            }
+                        fclose(f);
+                    }
+                    if (!ready)
+                        continue;
+                }
+
+                logline("target up: %s pid=%d", pkg, pid);
+                if (inject(pid, pkg) && once)
+                    return 0;
+            }
         }
         if (once)
             return 1;

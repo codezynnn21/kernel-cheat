@@ -23,9 +23,12 @@ static const char *kTargets[] = {
 
 inline bool is_target_package(const char *name)
 {
-    for (const char *t : kTargets)
-        if (strcmp(t, name) == 0)
+    for (const char *t : kTargets) {
+        size_t n = strlen(t);
+        // exact match, or one of the package's own `pkg:*` subprocesses
+        if (strncmp(t, name, n) == 0 && (name[n] == 0 || name[n] == ':'))
             return true;
+    }
     return false;
 }
 
@@ -71,9 +74,25 @@ struct AimConfig {
     int bone   = 0;
 };
 
+// userspace detection surface. none of this survives a kernel-side scanner or a
+// raw-syscall read of /proc/self/maps; it removes the obvious tells that ACE's
+// userland pass looks for. see README "stealth layer".
+struct StealthConfig {
+    int  enable      = 1;
+    int  hide_dl     = 1;   // filter our module out of dl_iterate_phdr
+    int  hide_maps   = 1;   // filter /proc/self/maps + smaps + smaps_rollup
+    int  unlink_self = 1;   // remove the staged .so after the loader maps it
+    int  quiet       = 0;   // suppress logcat output from payload + injector
+    int  precheck    = 1;   // skip symbols whose prologue is already hooked
+    int  hide_proc   = 1;   // injector: rename comm + argv[0], setsid()
+    char name[160]   = "libcodm,codm_overlay,/data/adb/codm";
+    char proc_name[32] = "kworker/u16:2";
+};
+
 struct CheatConfig {
     EspConfig esp;
     AimConfig aim;
+    StealthConfig stealth;
 };
 
 // ---- config file -------------------------------------------------------------
@@ -107,6 +126,10 @@ public:
                 out[i] = strtof(v, nullptr);
         }
     }
+
+    // second source, same keys. find() reads newest-first, so an add()ed file
+    // overrides the constructor's file without an explicit merge.
+    void add(const char *path) { load(path); }
 
 private:
     struct Entry { std::string k, v; };
@@ -142,9 +165,11 @@ private:
 
     const char *find(const char *key) const
     {
-        for (const auto &e : entries_)
-            if (e.k == key)
-                return e.v.c_str();
+        // newest file wins: config_load adds the app-readable mirror after the
+        // root-only original, so the injector's copy is authoritative
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
+            if (it->k == key)
+                return it->v.c_str();
         return nullptr;
     }
 };
@@ -154,8 +179,19 @@ private:
 // Payload logs go to logcat ("codm"), the dumper writes into the app's own
 // files dir so the game's uid owns the file.
 
+// inline function-local static: the ODR gives one instance across every TU
+inline bool &codm_quiet_flag()
+{
+    static bool q = false;
+    return q;
+}
+
+inline void codm_set_quiet(bool q) { codm_quiet_flag() = q; }
+
 inline void codm_log(const char *fmt, ...)
 {
+    if (codm_quiet_flag())
+        return;
     va_list ap;
     va_start(ap, fmt);
     __android_log_vprint(ANDROID_LOG_INFO, CODM_TAG, fmt, ap);
@@ -181,13 +217,38 @@ inline bool codm_data_path(const char *name, char *out, size_t cap)
     char pkg[256] = {0};
     if (!codm_self_pkg(pkg, sizeof(pkg)))
         return false;
+    // the data dir is keyed by the base package, never by `pkg:sub`
+    char *colon = strchr(pkg, ':');
+    if (colon)
+        *colon = 0;
     snprintf(out, cap, "/data/data/%s/files/%s", pkg, name);
+    return true;
+}
+
+// /data/data/<pkg>/code_cache/<name> — where the injector stages the payload and
+// the app-readable config copy (the game can never read /data/adb)
+inline bool codm_code_cache_path(const char *name, char *out, size_t cap)
+{
+    char pkg[256] = {0};
+    if (!codm_self_pkg(pkg, sizeof(pkg)))
+        return false;
+    char *colon = strchr(pkg, ':');
+    if (colon)
+        *colon = 0;
+    snprintf(out, cap, "/data/data/%s/code_cache/%s", pkg, name);
     return true;
 }
 
 inline void config_load(CheatConfig *cfg)
 {
     CfgFile f(CODM_CFG_PATH);
+    // the injector (root) mirrors the cfg into the app's code_cache; the payload
+    // runs as the app uid and cannot traverse /data/adb. last file wins.
+    {
+        char local[300];
+        if (codm_code_cache_path("codm.cfg", local, sizeof(local)))
+            f.add(local);
+    }
 
     cfg->esp.enable      = f.geti("esp.enable", cfg->esp.enable);
     cfg->esp.box         = f.geti("esp.box", cfg->esp.box);
@@ -232,4 +293,16 @@ inline void config_load(CheatConfig *cfg)
     cfg->aim.fov    = f.geti("aim.fov", cfg->aim.fov);
     cfg->aim.smooth = f.geti("aim.smooth", cfg->aim.smooth);
     cfg->aim.bone   = f.geti("aim.bone", cfg->aim.bone);
+
+    cfg->stealth.enable      = f.geti("stealth.enable", cfg->stealth.enable);
+    cfg->stealth.hide_dl     = f.geti("stealth.hide_dl", cfg->stealth.hide_dl);
+    cfg->stealth.hide_maps   = f.geti("stealth.hide_maps", cfg->stealth.hide_maps);
+    cfg->stealth.unlink_self = f.geti("stealth.unlink_self", cfg->stealth.unlink_self);
+    cfg->stealth.quiet       = f.geti("stealth.quiet", cfg->stealth.quiet);
+    cfg->stealth.precheck    = f.geti("stealth.precheck", cfg->stealth.precheck);
+    cfg->stealth.hide_proc   = f.geti("stealth.hide_proc", cfg->stealth.hide_proc);
+    copy(cfg->stealth.name, sizeof(cfg->stealth.name),
+         f.gets("stealth.hide", cfg->stealth.name));
+    copy(cfg->stealth.proc_name, sizeof(cfg->stealth.proc_name),
+         f.gets("stealth.proc_name", cfg->stealth.proc_name));
 }
