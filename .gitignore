@@ -1,0 +1,5 @@
+build/
+out/
+.fc/
+.cache/
+*.zip
