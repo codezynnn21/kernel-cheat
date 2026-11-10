@@ -1,0 +1,6 @@
+id=codm_overlay
+name=CODM Overlay (il2cpp ESP)
+version=v1.0.0
+versionCode=1
+author=oll
+description=ptrace-injected IL2CPP ESP overlay for Call of Duty Mobile. arm64, rooted, no Zygisk required.

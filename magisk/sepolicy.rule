@@ -1,0 +1,11 @@
+# Magisk applies these with magiskpolicy --live at boot.
+# The injector runs in u:r:magisk:s0 and must ptrace the game's untrusted_app domain.
+allow magisk appdomain process ptrace;
+allow magisk appdomain:fd use;
+# dlopen runs as the app uid. Since Android 10 SELinux denies executing files in
+# the app's writable data dir, which is exactly where the staged payload lives.
+allow untrusted_app app_data_file:file { execute execute_no_trans };
+allow untrusted_app_27 app_data_file:file { execute execute_no_trans };
+allow untrusted_app_25 app_data_file:file { execute execute_no_trans };
+# If injection still fails on a locked-down ROM, run once as root:
+#   magiskpolicy --live "allow magisk appdomain process { ptrace getattr }; allow magisk appdomain:dir search;"
