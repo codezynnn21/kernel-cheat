@@ -1,0 +1,109 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "CMakeLists.txt"
+      - "build.sh"
+      - "native/**"
+      - "magisk/**"
+      - "tools/**"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "CMakeLists.txt"
+      - "build.sh"
+      - "native/**"
+      - "magisk/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  module:
+    name: arm64 magisk module
+    runs-on: ubuntu-latest
+    env:
+      # keep FetchContent downloads outside build/ so the cache survives `rm -rf build`
+      FETCHCONTENT_BASE_DIR: ${{ github.workspace }}/.fc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve toolchain
+        run: |
+          set -euo pipefail
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$ndk" ]; then
+            for base in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "$HOME/Android/Sdk"; do
+              [ -n "$base" ] || continue
+              for c in "$base"/ndk/*; do
+                [ -d "$c" ] && ndk="$c"
+              done
+            done
+          fi
+          if [ -z "$ndk" ] || [ ! -d "$ndk" ]; then
+            echo "::error::no Android NDK on this runner"
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "NDK: $ndk"
+          grep -E '^Pkg.Revision' "$ndk/source.properties" || true
+          cmake --version | head -1
+          ninja --version
+          command -v zip || echo "no zip, build.sh falls back to python"
+
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: .fc
+          key: fetchcontent-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          # bash <script>, not ./build.sh: a web-UI upload lands without the exec bit
+          EXTRA_CMAKE_ARGS="-DFETCHCONTENT_BASE_DIR=$FETCHCONTENT_BASE_DIR" bash build.sh
+
+      - name: Verify module layout
+        run: |
+          set -euo pipefail
+          zip=out/codm_overlay.zip
+          [ -f "$zip" ] || { echo "::error::no zip produced"; exit 1; }
+          unzip -l "$zip"
+          listing=$(unzip -Z1 "$zip")
+          for f in module.prop customize.sh post-fs-data.sh service.sh uninstall.sh \
+                   codm.sh codm.cfg sepolicy.rule bin/codm-inject assets/libcodm.so; do
+            echo "$listing" | grep -qx "$f" || { echo "::error::missing $f in zip"; exit 1; }
+          done
+          unzip -p "$zip" module.prop | grep -qx 'id=codm_overlay'
+
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          for f in out/module/bin/codm-inject out/module/assets/libcodm.so; do
+            file "$f"
+            file "$f" | grep -q 'ARM aarch64' || { echo "::error::$f is not aarch64"; exit 1; }
+          done
+          # shadowhook must be compiled in, not a DT_NEEDED on a file the loader cannot find
+          if readelf -d out/module/assets/libcodm.so | grep -qi shadowhook; then
+            echo "::error::libcodm.so still depends on libshadowhook.so"
+            exit 1
+          fi
+          readelf -d out/module/assets/libcodm.so | grep NEEDED
+          test -x out/module/bin/codm-inject
+
+      - name: Upload module
+        uses: actions/upload-artifact@v4
+        with:
+          name: codm_overlay
+          path: out/codm_overlay.zip
+          if-no-files-found: error
+          retention-days: 30
